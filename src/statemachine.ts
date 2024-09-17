@@ -1,42 +1,27 @@
-import { ApiGatewayV2, CronArgs } from ".sst/platform/src/components/aws";
-import { ApiGatewayV2LambdaRoute } from ".sst/platform/src/components/aws/apigatewayv2-lambda-route";
-import { permission } from ".sst/platform/src/components/aws/permission";
-import {
-  Component,
-  Transform,
-  transform,
-} from ".sst/platform/src/components/component";
-import { Link } from ".sst/platform/src/components/link";
-import { physicalName } from ".sst/platform/src/components/naming";
-import { sfn } from "@pulumi/aws";
-import { StateMachineArgs } from "@pulumi/aws/sfn";
-import { ComponentResourceOptions, output, Output } from "@pulumi/pulumi";
+import { ComponentResource, ComponentResourceOptions, jsonStringify, interpolate } from "@pulumi/pulumi";
+import * as aws from "@pulumi/aws";
 import { Chainable } from "./state";
+import { Transform, physicalName, transform } from "./sst-helpers";
+
+export interface StateMachineArgs extends Partial<Omit<aws.sfn.StateMachineArgs, "definition">> {
+  definition: Chainable;
+  transform?: {
+    stateMachine?: Transform<aws.sfn.StateMachineArgs>;
+  };
+}
 
 const region = aws.config.requireRegion();
 
-type SFNArgs = Partial<Omit<StateMachineArgs, "definition">> & {
-  definition: Chainable;
-  /**
-   * [Transform](/docs/components#transform) how this component creates its underlying
-   * resources.
-   */
-  transform?: {
-    /**
-     * Transform the EventBus resource.
-     */
-    stateMachine?: Transform<sfn.StateMachineArgs>;
-  };
-};
-
-export class StateMachine extends Component implements Link.Linkable {
-  private stateMachine: Output<sfn.StateMachine>;
+export class StateMachine extends ComponentResource {
   static __pulumiType: string;
-
-  constructor(name: string, args: SFNArgs, opts?: ComponentResourceOptions) {
+  public readonly stateMachine: aws.sfn.StateMachine;
+  public readonly role: aws.iam.Role;
+  
+  constructor(name: string, args: StateMachineArgs, opts?: ComponentResourceOptions) {
     super(__pulumiType, name, args, opts);
 
-    const role = args.roleArn
+    // Create IAM role for the state machine
+    this.role = args.roleArn
       ? aws.iam.Role.get(
           `${$app.name}-${$app.stage}-${name}SfnRole`,
           args.roleArn
@@ -46,65 +31,67 @@ export class StateMachine extends Component implements Link.Linkable {
           assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
             Service: `states.${region}.amazonaws.com`,
           }),
-        });
+        }, { parent: this });
 
-    this.stateMachine = output(createStateMachine());
-    createPermissions();
-
-    function createPermissions() {
-      new aws.iam.RolePolicy(`${name}SfnRolePolicy`, {
-        role: role.id,
+    if (args.loggingConfiguration) {
+      new aws.iam.RolePolicy(`${name}BaseExecutionPolicy`, {
+        role: this.role.id,
         policy: {
           Version: "2012-10-17",
-          Statement: [
-            {
-              Effect: "Allow",
-              Action: ["events:*"],
-              Resource: "*",
-            },
-          ],
+          Statement: [{
+            Effect: "Allow",
+            Action: [
+              "logs:CreateLogGroup",
+              "logs:CreateLogStream",
+              "logs:PutLogEvents",
+              "logs:CreateLogDelivery",
+              "logs:GetLogDelivery",
+              "logs:UpdateLogDelivery",
+              "logs:DeleteLogDelivery",
+              "logs:ListLogDeliveries",
+              "logs:PutResourcePolicy",
+              "logs:DescribeResourcePolicies",
+              "logs:DescribeLogGroups",
+            ],
+            Resource: "*",
+          }],
         },
-      });
-      args.definition.createPermissions(role, name);
+      }, { parent: this });
     }
 
-    function createStateMachine() {
-      return new sfn.StateMachine(
-        ...transform(
-          args.transform?.stateMachine,
-          `${name}StateMachine`,
+    new aws.iam.RolePolicy(`${name}EventPolicy`, {
+      role: this.role.id,
+      policy: {
+        Version: "2012-10-17",
+        Statement: [
           {
-            name: physicalName(256, name),
-            definition: $jsonStringify(args.definition.serializeToDefinition()),
-            roleArn: role.arn,
+            Effect: "Allow",
+            Action: ["events:*"],
+            Resource: "*",
           },
-          // TODO: args.type needs to be added to known types in Component
-          // { parent }
-          {}
-        )
-      );
-    }
-  }
-
-  /** @internal */
-  public getSSTLink() {
-    return {
-      properties: {
-        id: this.id,
-        arn: this.arn,
+        ],
       },
-      include: [
-        permission({
-          actions: ["states:*"],
-          resources: [
-            this.stateMachine.arn,
-            $interpolate`${this.stateMachine.arn.apply((arn) =>
-              arn.replace("stateMachine", "execution")
-            )}:*`,
-          ],
-        }),
-      ],
-    };
+    }, { parent: this });
+
+    args.definition.createPermissions(this.role, name);
+
+    this.stateMachine = new aws.sfn.StateMachine(
+      ...transform(
+        args.transform?.stateMachine,
+        `${name}StateMachine`,
+        {
+          name: physicalName(256, name),
+          definition: jsonStringify(args.definition.serializeToDefinition()),
+          roleArn: this.role.arn,
+        },
+        { parent: this }
+      )
+    );
+
+    this.registerOutputs({
+        stateMachine: this.stateMachine,
+        role: this.role,
+    });
   }
 
   /**
@@ -121,64 +108,27 @@ export class StateMachine extends Component implements Link.Linkable {
     return this.stateMachine.arn;
   }
 
-  public addCronTrigger(
-    name: string,
-    schedule: CronArgs["schedule"],
-    input?: Record<string, unknown>
-  ): sst.aws.Cron {
-    return new sst.aws.Cron(name, {
-      schedule,
-      job: {
-        // TODO: handler path should be relative to the root of the project
-        // handler: join(__dirname, "./functions/trigger.handler"),
-        handler: "packages/sst-sfn/src/functions/trigger.handler",
-        link: [this],
+  /** @internal */
+  public getSSTLink() {
+    return {
+      properties: {
+        id: this.stateMachine.id,
+        arn: this.stateMachine.arn,
+        roleArn: this.role.arn
       },
-      transform: {
-        target: {
-          input: $jsonStringify({ stateMachineArn: this.arn, input }),
+      include: [
+        {
+          type: "aws.permission",
+          actions: ["states:*"],
+          resources: [
+            this.stateMachine.arn,
+            interpolate`${this.stateMachine.arn.apply((arn) =>
+              arn.replace("stateMachine", "execution")
+            )}:*`,
+          ],
         },
-      },
-    });
-  }
-
-  public addApiGatewayV2Trigger(
-    rawRoute: string,
-    api: ApiGatewayV2
-  ): ApiGatewayV2LambdaRoute {
-    return api.route(rawRoute, {
-      // TODO: handler path should be relative to the root of the project
-      handler: "packages/sst-sfn/src/functions/api-trigger.handler",
-      environment: {
-        SFN_STATE_MACHINE: this.arn,
-      },
-      link: [this],
-    });
-  }
-
-  public addApiGatewayV2TaskCommandSuccessHandler(
-    rawRoute: string,
-    api: ApiGatewayV2
-  ): ApiGatewayV2LambdaRoute {
-    return this.addApiGatewayV2TaskCommandHandler("success", rawRoute, api);
-  }
-  public addApiGatewayV2TaskCommandFailureHandler(
-    rawRoute: string,
-    api: ApiGatewayV2
-  ): ApiGatewayV2LambdaRoute {
-    return this.addApiGatewayV2TaskCommandHandler("failure", rawRoute, api);
-  }
-  protected addApiGatewayV2TaskCommandHandler(
-    command: "success" | "failure",
-    rawRoute: string,
-    api: ApiGatewayV2
-  ): ApiGatewayV2LambdaRoute {
-    return api.route(rawRoute, {
-      // TODO: handler path should be relative to the root of the project
-      handler: `packages/sst-sfn/src/functions/api-send-task-${command}.handler`,
-      memory: "128 MB",
-      link: [this],
-    });
+      ],
+    };
   }
 }
 
